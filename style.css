@@ -1,6 +1,28 @@
 /* Omni API Tracker - SillyTavern Extension Styles (Dark Studio v1.4.0) */
 
 /* 顶栏小徽章按钮 */
+/* 自由悬浮胶囊模式（默认推荐，可任意拖拽记忆位置） */
+#omni_tracker_topbar_btn.omni-floating {
+    position: fixed !important;
+    top: 75px;
+    right: 14px;
+    z-index: 9999;
+    margin: 0 !important;
+    padding: 5px 12px;
+    border-radius: 16px;
+    background: rgba(18, 18, 26, 0.95);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(52, 211, 153, 0.6);
+    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.7), 0 0 10px rgba(52, 211, 153, 0.25);
+    cursor: grab;
+    touch-action: none;
+}
+
+#omni_tracker_topbar_btn.omni-floating:active {
+    cursor: grabbing;
+    transform: scale(0.97);
+}
+
 #omni_tracker_topbar_btn {
     display: inline-flex;
     align-items: center;

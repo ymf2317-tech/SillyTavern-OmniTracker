@@ -1,9 +1,9 @@
 /**
- * Omni API Tracker for SillyTavern (v1.5.2 智能去水清洗版)
- * 以模型资产为中心（Model-First），通用无遗漏审计 + 冒险者公会手账
+ * Omni API Tracker for SillyTavern (v1.6.0 自由悬浮胶囊与全域向量版)
+ * 以模型资产为中心（Model-First），支持可拖拽悬浮胶囊、全域向量/重排统计 + 冒险者公会手账
  * 
  * @author ymf2317-tech & @黎吧啦
- * @version 1.5.2
+ * @version 1.6.0
  */
 
 import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
@@ -88,7 +88,7 @@ const RPG_CONFIG = {
     ]
 };
 
-// 4大客观通道定义（放之四海而皆准，不依赖具体插件名）
+// 4大客观通道定义
 const CATEGORY_MAP = {
     chat: { label: '主聊对话', color: '#38bdf8', icon: 'fa-comment-dots' },
     scripts: { label: '扩展/预设/后台', color: '#f59e0b', icon: 'fa-bolt' },
@@ -100,6 +100,8 @@ const CATEGORY_MAP = {
 const defaultSettings = {
     enabled: true,
     showInTopBar: true,
+    badgeMode: 'floating', // 'floating' (自由悬浮胶囊) | 'topbar' (顶栏内嵌)
+    badgePos: null, // { top: number, left: number }
     totals: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0 },
     today: { date: getTodayDateString(), prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0 },
     session: { startTime: Date.now(), prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0 },
@@ -109,7 +111,7 @@ const defaultSettings = {
         tts: { label: '语音合成(TTS)', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#14b8a6' },
         vectors: { label: '向量与重排', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#10b981' },
     },
-    byModel: {}, // { modelName: { prompt_tokens, completion_tokens, total_tokens, requests, byCategory: { chat: {...}, scripts: {...} } } }
+    byModel: {}, // { modelName: { prompt_tokens, completion_tokens, total_tokens, requests, byCategory: { ... } } }
     recentLogs: [],
     activeTime: {
         daily: {},
@@ -133,6 +135,10 @@ function loadSettings() {
         if (settings[key] === undefined) {
             settings[key] = JSON.parse(JSON.stringify(defaultSettings[key]));
         }
+    }
+
+    if (settings.badgeMode === undefined) {
+        settings.badgeMode = 'floating';
     }
 
     // 确保 4 大通道存在
@@ -191,46 +197,54 @@ function migrateLegacyActiveTime() {
 }
 
 /**
- * 智能清洗与去水函数（老用户一键修复旧版误抓产生的虚高数据）
- * 100% 保留所有真实回复(Completion)、TTS语音、RPG活跃时长与成就
+ * 智能清洗与去水函数（修复旧版本误抓产生的虚假数据）
+ * 100% 保护：真实回复 (Completion)、TTS语音、向量/重排模型 (Vectors)、RPG活跃时长与成就
  */
-function cleanHistoricalWaterData(interactive = true) {
-    if (!settings || !settings.byModel) return;
+function cleanHistoricalWaterData() {
+    if (!settings || !settings.byModel) return { cleanedTokens: 0, removedModels: [] };
 
     let removedFakeModels = [];
     let adjustedPromptTokens = 0;
     const bm = settings.byModel;
 
-    // 1. 扫描并清除无任何输出的纯假模型（非 TTS）
+    // 1. 扫描并清除无任何输出且非向量/TTS的纯假模型
     for (const [m, v] of Object.entries(bm)) {
-        if (m === 'Unknown' || 'tts' in m.toLowerCase() || 'mimo' in m.toLowerCase()) continue;
+        const ml = m.toLowerCase();
+        if (m === 'Unknown' || ml.includes('tts') || ml.includes('mimo')) continue;
+
+        // 保护向量模型：向量模型天生无 completion_tokens
+        const isVectorModel = v.byCategory?.vectors ||
+            ml.includes('embed') ||
+            ml.includes('rerank') ||
+            ml.includes('bge') ||
+            ml.includes('vector');
+        if (isVectorModel) continue;
+
         const c = v.completion_tokens || 0;
         const p = v.prompt_tokens || 0;
 
-        // 如果输出全为 0，且输入大于 0，说明纯属内部数据传输
         if (c === 0 && p > 0) {
             removedFakeModels.push(m);
             delete bm[m];
         }
     }
 
-    // 2. 校准被正则修剪严重注水的真实模型（输入输出比畸形 > 60:1）
+    // 2. 校准被正则修剪严重注水的真实文本模型（输入输出比畸形 > 60:1）
     for (const [m, v] of Object.entries(bm)) {
-        if ('tts' in m.toLowerCase() || 'mimo' in m.toLowerCase()) continue;
+        const ml = m.toLowerCase();
+        if (ml.includes('tts') || ml.includes('mimo') || ml.includes('embed') || ml.includes('rerank') || ml.includes('bge') || v.byCategory?.vectors) continue;
         const c = v.completion_tokens || 0;
         const p = v.prompt_tokens || 0;
 
         if (c > 0 && p > 0) {
             const ratio = p / c;
-            // 正常聊天上下文与回复比通常在 10:1 到 35:1 之间，若超过 60:1 说明经历了海量重复 process 注入
             if (ratio > 60) {
-                // 根据输出字数合理校准真实上下文输入（按 25:1 的重度上下文基准校准）
                 const realisticPrompt = Math.round(c * 25);
                 if (p > realisticPrompt) {
                     adjustedPromptTokens += (p - realisticPrompt);
                     v.prompt_tokens = realisticPrompt;
                     v.total_tokens = realisticPrompt + c;
-                    v.requests = Math.max(1, Math.round(c / 1500)); // 校准真实请求轮次
+                    v.requests = Math.max(1, Math.round(c / 1500));
 
                     if (v.byCategory && v.byCategory.chat) {
                         v.byCategory.chat.prompt_tokens = realisticPrompt;
@@ -242,9 +256,9 @@ function cleanHistoricalWaterData(interactive = true) {
         }
     }
 
-    // 3. 清理 recentLogs 中的假记录
+    // 3. 清理 recentLogs 中的假记录（保留真实回复、TTS与向量检索）
     const oldLogs = settings.recentLogs || [];
-    const cleanLogs = oldLogs.filter(r => (r.completion_tokens > 0 || r.category === 'tts'));
+    const cleanLogs = oldLogs.filter(r => (r.completion_tokens > 0 || r.category === 'tts' || r.category === 'vectors'));
     settings.recentLogs = cleanLogs;
 
     // 4. 重新聚合 totals
@@ -271,8 +285,10 @@ function cleanHistoricalWaterData(interactive = true) {
     }
 
     for (const [m, v] of Object.entries(bm)) {
-        const isTTS = 'tts' in m.toLowerCase() || 'mimo' in m.toLowerCase();
-        const catKey = isTTS ? 'tts' : 'chat';
+        const ml = m.toLowerCase();
+        const isTTS = ml.includes('tts') || ml.includes('mimo');
+        const isVec = ml.includes('embed') || ml.includes('rerank') || ml.includes('bge') || v.byCategory?.vectors;
+        const catKey = isTTS ? 'tts' : (isVec ? 'vectors' : 'chat');
         const target = settings.byCategory[catKey];
         target.prompt_tokens += (v.prompt_tokens || 0);
         target.completion_tokens += (v.completion_tokens || 0);
@@ -280,7 +296,6 @@ function cleanHistoricalWaterData(interactive = true) {
         target.requests += (v.requests || 0);
     }
 
-    // 校准 today（防止今日数据仍显示旧的虚高）
     if (settings.today) {
         settings.today.prompt_tokens = Math.min(settings.today.prompt_tokens, settings.totals.prompt_tokens);
         settings.today.completion_tokens = Math.min(settings.today.completion_tokens, settings.totals.completion_tokens);
@@ -295,6 +310,14 @@ function cleanHistoricalWaterData(interactive = true) {
         cleanedTokens: adjustedPromptTokens,
         newTotal: settings.totals.total_tokens,
     };
+}
+
+function recalculateTotalActiveMs() {
+    let sum = 0;
+    for (const ms of Object.values(settings.activeTime.daily)) {
+        sum += (ms || 0);
+    }
+    settings.activeTime.totalMs = sum;
 }
 
 function safeSaveSettings() {
@@ -367,7 +390,7 @@ function estimateTokens(text) {
 }
 
 /**
- * 通用多层模型探测器：从各种可能的载荷路径中挖出真实的模型名
+ * 通用多层模型探测器：支持大模型、向量模型与重排模型
  */
 function extractModelName(obj, url) {
     if (obj && typeof obj === 'object') {
@@ -375,6 +398,11 @@ function extractModelName(obj, url) {
             obj.model,
             obj.model_name,
             obj.engine,
+            obj.embedding_model,
+            obj.rerank_model,
+            obj.sourceSettings?.model,
+            obj.sourceSettings?.ollama_model,
+            obj.sourceSettings?.embedding_model,
             obj.generate_data?.model,
             obj.api?.model,
             obj.overrides?.model,
@@ -396,21 +424,34 @@ function extractModelName(obj, url) {
         } catch (_) {}
     }
 
+    // 向量端点默认兜底
+    if (url) {
+        const u = String(url).toLowerCase();
+        if (u.includes('/rerank')) return 'bge-reranker';
+        if (u.includes('/embed') || u.includes('/embeddings')) return 'embedding-model';
+    }
+
     return '';
 }
 
 /**
- * 统一 Token 用量解析（兼容 OpenAI/Claude/Gemini/Ollama）
+ * 统一 Token 用量解析（兼容 OpenAI/Claude/Gemini/Ollama/Cohere/BGE）
  */
 function applyUsageFrom(trackerItem, usageObj) {
     if (!usageObj || typeof usageObj !== 'object') return false;
 
-    const pIn = usageObj.prompt_tokens ?? usageObj.input_tokens ?? usageObj.promptTokenCount ?? usageObj.prompt_token_count;
-    const cOut = usageObj.completion_tokens ?? usageObj.output_tokens ?? usageObj.candidatesTokenCount ?? usageObj.candidates_token_count;
+    const pIn = usageObj.prompt_tokens ?? usageObj.input_tokens ?? usageObj.promptTokenCount ?? usageObj.prompt_token_count ?? usageObj.prompt_eval_count;
+    const cOut = usageObj.completion_tokens ?? usageObj.output_tokens ?? usageObj.candidatesTokenCount ?? usageObj.candidates_token_count ?? usageObj.eval_count;
+    const tot = usageObj.total_tokens ?? usageObj.totalTokenCount ?? usageObj.total_token_count;
 
     let hit = false;
     if (typeof pIn === 'number' && pIn > 0) { trackerItem.prompt_tokens = pIn; hit = true; }
     if (typeof cOut === 'number' && cOut > 0) { trackerItem.completion_tokens = cOut; hit = true; }
+    // 向量/重排通常只有 total_tokens 且无 completion，直接归入 prompt_tokens
+    if (!hit && typeof tot === 'number' && tot > 0) {
+        trackerItem.prompt_tokens = tot;
+        hit = true;
+    }
     return hit;
 }
 
@@ -445,8 +486,7 @@ function extractOutputText(data) {
 }
 
 /**
- * 通用精准拦截探针：只拦截真正的 LLM 生成与向量/语音端点
- * 彻底剔除酒馆内部的 /process(正则修剪)、/status(探活)、/bias(偏置)、/plugins(插件存储) 等纯数据传输
+ * 通用精准拦截探针：只拦截真正的 LLM 生成、向量、重排与语音端点
  */
 function isTargetLLMApi(url, options) {
     if (!url) return false;
@@ -456,7 +496,7 @@ function isTargetLLMApi(url, options) {
     else if (url && url.url) urlStr = url.url;
     urlStr = urlStr.toLowerCase();
 
-    // 1. 坚决排除内部辅助/数据传输路由（绝非大模型调用）
+    // 1. 排除酒馆内部纯数据传输与本地处理
     if (urlStr.includes('/chat-completions/process') ||
         urlStr.includes('/chat-completions/bias') ||
         urlStr.includes('/chat-completions/status') ||
@@ -467,7 +507,7 @@ function isTargetLLMApi(url, options) {
         return false;
     }
 
-    // 2. 酒馆官方生成出口（唯一的真实生成通道）
+    // 2. 酒馆官方生成出口
     if (urlStr.includes('/api/backends/chat-completions/generate') ||
         urlStr.includes('/api/backends/text-completions/generate') ||
         urlStr.includes('/api/backends/kobold/generate') ||
@@ -475,20 +515,19 @@ function isTargetLLMApi(url, options) {
         return true;
     }
 
-    // 3. 外部直连大模型标准生成端点（狐裁、独立中转、第三方 API）
+    // 3. 外部直连大模型生成端点
     if (urlStr.includes('/chat/completions') ||
         urlStr.endsWith('/completions') ||
-        urlStr.includes('/completions?') ||
-        urlStr.includes('/v1/models')) {
-        // 排除纯列表查询
+        urlStr.includes('/completions?')) {
         if (urlStr.includes('/models')) return false;
         return true;
     }
 
-    // 4. 向量嵌入与 Rerank 精排端点（狐忆、玄狐台、Ollama、自建 /embed）
+    // 4. 向量嵌入与 Rerank 端点（涵盖 狐忆 / 玄狐台 / Ollama / 硅基流动 / ST原生向量 / 自建 /embed）
     if (urlStr.includes('/embeddings') ||
-        urlStr.includes('/embed/') ||
-        urlStr.includes('/rerank')) {
+        urlStr.includes('/embed') ||
+        urlStr.includes('/rerank') ||
+        urlStr.includes('/api/vector/')) {
         return true;
     }
 
@@ -503,7 +542,7 @@ function isTargetLLMApi(url, options) {
 }
 
 /**
- * 客观轻量归因（4大通道，不硬编码具体插件名）
+ * 客观轻量归因（4大客观通道）
  */
 function classifyRequest(stack, url, reqBodyParsed, isStream, modelName) {
     const s = (stack || '').toLowerCase();
@@ -516,14 +555,15 @@ function classifyRequest(stack, url, reqBodyParsed, isStream, modelName) {
     }
 
     // 2. 向量检索与重排 (Embeddings / Rerank)
-    if (u.includes('/embeddings') || u.includes('/embed') || u.includes('/rerank') || m.includes('embed') || m.includes('rerank')) {
+    if (u.includes('/embeddings') || u.includes('/embed') || u.includes('/rerank') || u.includes('/api/vector') || m.includes('embed') || m.includes('rerank') || m.includes('bge') || m.includes('qwen3-embed')) {
         let caller = '向量检索';
-        if (u.includes('/rerank') || m.includes('rerank')) caller = 'Rerank重排';
-        else if (u.includes('/embed') || m.includes('embed')) caller = 'Embedding嵌入';
+        if (u.includes('/rerank') || m.includes('rerank')) caller = 'Rerank精排';
+        else if (u.includes('/embed') || u.includes('/embeddings') || m.includes('embed')) caller = 'Embedding嵌入';
+        else if (u.includes('/api/vector')) caller = 'ST原生向量';
         return { category: 'vectors', caller };
     }
 
-    // 3. 官方主聊正文判断（严格凭证：官方请求体 type）
+    // 3. 官方主聊正文判断（凭证：官方请求体 type）
     const reqType = (typeof reqBodyParsed?.type === 'string') ? reqBodyParsed.type.toLowerCase() : '';
     const MAIN_CHAT_TYPES = ['normal', 'regenerate', 'swipe', 'continue', 'impersonate', 'first_message'];
 
@@ -531,8 +571,7 @@ function classifyRequest(stack, url, reqBodyParsed, isStream, modelName) {
         return { category: 'chat', caller: '主聊对话' };
     }
 
-    // 4. 其余所有的 LLM 调用，客观归入“扩展/预设/后台”
-    // （包括狐裁、狐忆逻辑、小白盒、预设宏、世界书、翻译、自动总结等）
+    // 4. 其余所有的 LLM 调用归入“扩展/预设/后台”
     let caller = '扩展与预设';
     if (reqType === 'quiet') caller = '后台静默(quiet)';
     else if (s.includes('slash')) caller = 'Slash命令/宏';
@@ -574,14 +613,12 @@ function recordApiUsage(item) {
     settings.session.total_tokens += tTokens;
     settings.session.requests += 1;
 
-    // 通道统计
     const cat = settings.byCategory[item.category] || settings.byCategory.scripts;
     cat.prompt_tokens += pTokens;
     cat.completion_tokens += cTokens;
     cat.total_tokens += tTokens;
     cat.requests += 1;
 
-    // 模型统计（核心：支持模型内部细分通道）
     const mName = item.model || 'Unknown';
     if (!settings.byModel[mName]) {
         settings.byModel[mName] = {
@@ -608,7 +645,6 @@ function recordApiUsage(item) {
     mCat.total_tokens += tTokens;
     mCat.requests += 1;
 
-    // 实时流水
     const logEntry = {
         id: Date.now() + Math.random().toString(36).substring(2, 6),
         time: new Date().toLocaleTimeString(),
@@ -671,7 +707,7 @@ function installFetchHook() {
                     if (detectedModel) trackerItem.model = detectedModel;
                     trackerItem.is_stream = !!parsedReq.stream;
 
-                    // 估算输入 Token 兜底
+                    // 估算输入 Token（覆盖对话、单句、批量向量、Rerank、原生向量）
                     if (Array.isArray(parsedReq.messages)) {
                         let combinedText = '';
                         for (const m of parsedReq.messages) {
@@ -682,6 +718,32 @@ function installFetchHook() {
                         trackerItem.prompt_tokens = estimateTokens(parsedReq.prompt);
                     } else if (typeof parsedReq.input === 'string') {
                         trackerItem.prompt_tokens = estimateTokens(parsedReq.input);
+                    } else if (Array.isArray(parsedReq.input)) {
+                        // 向量批量嵌入输入
+                        let combined = '';
+                        for (const it of parsedReq.input) {
+                            if (typeof it === 'string') combined += it + ' ';
+                            else if (it?.text) combined += it.text + ' ';
+                        }
+                        trackerItem.prompt_tokens = estimateTokens(combined);
+                    } else if (typeof parsedReq.query === 'string' && Array.isArray(parsedReq.documents)) {
+                        // Rerank 结构 {"query": "...", "documents": ["...", ...]}
+                        let combined = parsedReq.query + '\n';
+                        for (const doc of parsedReq.documents) {
+                            if (typeof doc === 'string') combined += doc + '\n';
+                            else if (doc?.text) combined += doc.text + '\n';
+                        }
+                        trackerItem.prompt_tokens = estimateTokens(combined);
+                    } else if (typeof parsedReq.searchText === 'string') {
+                        // 酒馆原生向量检索
+                        trackerItem.prompt_tokens = estimateTokens(parsedReq.searchText);
+                    } else if (Array.isArray(parsedReq.items)) {
+                        // 酒馆原生向量插入
+                        let combined = '';
+                        for (const it of parsedReq.items) {
+                            if (typeof it?.text === 'string') combined += it.text + ' ';
+                        }
+                        trackerItem.prompt_tokens = estimateTokens(combined);
                     }
                 } catch (_) {}
             }
@@ -705,12 +767,10 @@ function installFetchHook() {
 
         try {
             if (response && response.ok) {
-                // 稳健判流：结合 Content-Type 与 请求参数
                 const contentType = (response.headers?.get('content-type') || '').toLowerCase();
                 const isSSE = contentType.includes('text/event-stream') || trackerItem.is_stream;
 
                 if (isSSE && response.body && typeof response.body.tee === 'function') {
-                    // 流式响应 (SSE)：利用 body.tee() 镜像旁路分流
                     trackerItem.is_stream = true;
                     const [streamMain, streamTracker] = response.body.tee();
                     consumeStreamForMetrics(streamTracker, trackerItem, startTime);
@@ -721,35 +781,32 @@ function installFetchHook() {
                         headers: response.headers,
                     });
                 } else {
-                    // 非流式响应：使用 text() 兜底读取，绝不发生 SyntaxError
                     trackerItem.duration_ms = Math.round(performance.now() - startTime);
                     const cloned = response.clone();
 
                     cloned.text().then(rawText => {
                         try {
                             const data = JSON.parse(rawText);
-                            // 1. 尝试从返回体补齐模型
-                            const respModel = extractModelName(data);
+                            const respModel = extractModelName(data, trackerItem.url);
                             if ((!trackerItem.model || trackerItem.model === 'Unknown') && respModel) {
                                 trackerItem.model = respModel;
                             }
 
-                            // 2. 提取 usage 字段
                             let hitUsage = false;
                             if (data && typeof data === 'object') {
                                 hitUsage = applyUsageFrom(trackerItem, data.usage)
                                     || applyUsageFrom(trackerItem, data.usageMetadata)
-                                    || applyUsageFrom(trackerItem, data.usage_metadata);
+                                    || applyUsageFrom(trackerItem, data.usage_metadata)
+                                    || applyUsageFrom(trackerItem, data); // 很多向量接口 (Ollama) 直接将 prompt_eval_count 放在根级
                             }
 
-                            // 3. 兜底提取输出文本算 Token
-                            if (!hitUsage) {
+                            // 仅对非向量生成类接口兜底提取输出文本
+                            if (!hitUsage && trackerItem.category !== 'vectors') {
                                 const outText = extractOutputText(data);
                                 if (outText) trackerItem.completion_tokens = estimateTokens(outText);
                             }
                         } catch (_) {
-                            // 返回体不是 JSON（可能是纯文本），直接文本估算，绝不记 0
-                            if (rawText && rawText.length > 0 && !contentType.includes('audio')) {
+                            if (rawText && rawText.length > 0 && !contentType.includes('audio') && trackerItem.category !== 'vectors') {
                                 trackerItem.completion_tokens = estimateTokens(rawText);
                             }
                         }
@@ -766,7 +823,7 @@ function installFetchHook() {
         return response;
     };
 
-    console.log('[OmniTracker] 通用模型账本拦截器已就绪 (v1.5.0)');
+    console.log('[OmniTracker] 自由悬浮与全域向量拦截器已就绪 (v1.6.0)');
 }
 
 async function consumeStreamForMetrics(stream, trackerItem, startTime) {
@@ -794,17 +851,14 @@ async function consumeStreamForMetrics(stream, trackerItem, startTime) {
                 try {
                     const parsed = JSON.parse(dataStr);
 
-                    // 1. 从流式分片里补齐真实模型名（上游一手证据）
                     if ((!trackerItem.model || trackerItem.model === 'Unknown') && typeof parsed.model === 'string' && parsed.model.trim()) {
                         trackerItem.model = parsed.model.trim();
                     }
 
-                    // 2. 合并流式 usage
                     if (parsed.usage) officialUsage = parsed.usage;
                     else if (parsed.usageMetadata) officialUsage = parsed.usageMetadata;
                     else if (parsed.usage_metadata) officialUsage = parsed.usage_metadata;
 
-                    // 3. 拼接文本
                     const chunk = parsed.choices?.[0]?.delta?.content
                         || parsed.choices?.[0]?.text
                         || parsed.delta
@@ -824,12 +878,101 @@ async function consumeStreamForMetrics(stream, trackerItem, startTime) {
         if (officialUsage) {
             usageHit = applyUsageFrom(trackerItem, officialUsage);
         }
-        if (!usageHit) {
+        if (!usageHit && trackerItem.category !== 'vectors') {
             trackerItem.completion_tokens = estimateTokens(accumulatedText);
         }
 
         recordApiUsage(trackerItem);
     }
+}
+
+/**
+ * 赋予胶囊自由拖拽与位置记忆能力（兼容手机触屏与电脑鼠标）
+ */
+function makePillDraggable($el) {
+    let isDragging = false;
+    let startX = 0, startY = 0;
+    let initialLeft = 0, initialTop = 0;
+    let hasMoved = false;
+
+    // 载入保存的位置
+    const savedPos = settings.badgePos || JSON.parse(localStorage.getItem('omni_badge_pos') || 'null');
+    if (savedPos && savedPos.top !== undefined && savedPos.left !== undefined) {
+        const clampTop = Math.min(window.innerHeight - 36, Math.max(10, savedPos.top));
+        const clampLeft = Math.min(window.innerWidth - 80, Math.max(10, savedPos.left));
+        $el.css({
+            top: clampTop + 'px',
+            left: clampLeft + 'px',
+            right: 'auto',
+            bottom: 'auto',
+        });
+    }
+
+    function onPointerDown(e) {
+        if (e.type === 'mousedown' && e.button !== 0) return;
+        isDragging = true;
+        hasMoved = false;
+
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        startX = clientX;
+        startY = clientY;
+
+        const rect = $el[0].getBoundingClientRect();
+        initialLeft = rect.left;
+        initialTop = rect.top;
+
+        $(document).on('mousemove.omni touchmove.omni', onPointerMove);
+        $(document).on('mouseup.omni touchend.omni', onPointerUp);
+    }
+
+    function onPointerMove(e) {
+        if (!isDragging) return;
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        const dx = clientX - startX;
+        const dy = clientY - startY;
+
+        if (Math.abs(dx) > 4 || Math.abs(dy) > 4) {
+            hasMoved = true;
+        }
+
+        if (hasMoved) {
+            if (e.cancelable) e.preventDefault();
+            const w = $el.outerWidth() || 90;
+            const h = $el.outerHeight() || 28;
+            const newLeft = Math.max(5, Math.min(window.innerWidth - w - 5, initialLeft + dx));
+            const newTop = Math.max(5, Math.min(window.innerHeight - h - 5, initialTop + dy));
+            $el.css({ left: newLeft + 'px', top: newTop + 'px', right: 'auto', bottom: 'auto' });
+        }
+    }
+
+    function onPointerUp(e) {
+        if (!isDragging) return;
+        isDragging = false;
+        $(document).off('.omni');
+
+        if (hasMoved) {
+            const rect = $el[0].getBoundingClientRect();
+            const pos = { top: Math.round(rect.top), left: Math.round(rect.left) };
+            settings.badgePos = pos;
+            localStorage.setItem('omni_badge_pos', JSON.stringify(pos));
+            safeSaveSettings();
+        }
+    }
+
+    $el.off('mousedown.omni touchstart.omni').on('mousedown.omni touchstart.omni', onPointerDown);
+
+    // 点击事件过滤：若拖拽发生则阻止弹窗触发
+    $el.off('click.omni').on('click.omni', function (e) {
+        if (hasMoved) {
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            hasMoved = false;
+            return;
+        }
+        showDashboardModal();
+    });
 }
 
 // --- UI 挂载与渲染 ---
@@ -839,35 +982,38 @@ function tryMountUI() {
         return;
     }
 
-    if (settings && settings.showInTopBar) {
-        if ($('#omni_tracker_topbar_btn').length === 0) {
-            const btnHtml = `
-                <div id="omni_tracker_topbar_btn" title="Omni API Tracker: 点击打开通用模型账本 (长按可隐藏)">
-                    <i class="fa-solid fa-bolt"></i>
-                    <span id="omni_tracker_topbar_text">0</span>
-                </div>
-            `;
+    $('#omni_tracker_topbar_btn').remove();
 
+    if (settings && settings.showInTopBar) {
+        const isFloating = (settings.badgeMode !== 'topbar');
+        const btnHtml = `
+            <div id="omni_tracker_topbar_btn" class="${isFloating ? 'omni-floating' : ''}" title="Omni API Tracker: 点击打开通用模型账本 (拖动可挪位置)">
+                <i class="fa-solid fa-bolt"></i>
+                <span id="omni_tracker_topbar_text">0</span>
+            </div>
+        `;
+
+        if (isFloating) {
+            $('body').append(btnHtml);
+            makePillDraggable($('#omni_tracker_topbar_btn'));
+        } else {
             if ($('#top-bar').length) {
                 $('#top-bar').append(btnHtml);
             } else if ($('#chat_header').length) {
                 $('#chat_header').append(btnHtml);
             }
-
             $('#omni_tracker_topbar_btn').on('click', showDashboardModal);
-
-            $('#omni_tracker_topbar_btn').on('contextmenu', function (e) {
-                e.preventDefault();
-                if (confirm('是否隐藏顶栏快捷指示器？\n（可随时在右侧扩展列表中重新开启）')) {
-                    settings.showInTopBar = false;
-                    safeSaveSettings();
-                    $('#omni_tracker_topbar_btn').remove();
-                    syncDrawerCheckbox();
-                }
-            });
         }
-    } else {
-        $('#omni_tracker_topbar_btn').remove();
+
+        $('#omni_tracker_topbar_btn').on('contextmenu', function (e) {
+            e.preventDefault();
+            if (confirm('是否隐藏快捷指示器？\n（可随时在右侧扩展列表中重新开启，或在设置中切换为顶栏内嵌）')) {
+                settings.showInTopBar = false;
+                safeSaveSettings();
+                $('#omni_tracker_topbar_btn').remove();
+                syncDrawerCheckbox();
+            }
+        });
     }
 
     mountExtensionSettingsDrawer();
@@ -889,11 +1035,11 @@ function mountExtensionSettingsDrawer() {
                 </div>
                 <div class="inline-drawer-content" style="padding: 12px; background: rgba(0,0,0,0.25); border-radius: 6px;">
                     <p style="font-size:12px; color:#cbd5e1; margin-bottom: 12px; line-height: 1.5;">
-                        通用全量监听：分模型清晰核算主聊对话、预设/后台脚本、TTS语音、向量检索；内置冒险者公会活跃手账。
+                        通用全量监听：分模型核算主聊对话、预设/后台脚本、TTS语音、向量/重排检索；内置可拖拽悬浮胶囊与公会手账。
                     </p>
 
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; padding:8px 10px; background:rgba(255,255,255,0.05); border-radius:6px;">
-                        <span style="font-size:12px; font-weight:700; color:#fff;">显示顶栏快捷指示器</span>
+                        <span style="font-size:12px; font-weight:700; color:#fff;">显示快捷指示器胶囊</span>
                         <label class="omni-switch">
                             <input type="checkbox" id="omni_drawer_toggle_topbar" ${settings?.showInTopBar ? 'checked' : ''}>
                             <span class="omni-slider"></span>
@@ -924,6 +1070,7 @@ function syncDrawerCheckbox() {
     if (!settings) return;
     $('#omni_drawer_toggle_topbar').prop('checked', !!settings.showInTopBar);
     $('#omni_modal_toggle_topbar').prop('checked', !!settings.showInTopBar);
+    $('#omni_badge_mode_select').val(settings.badgeMode || 'floating');
 }
 
 function triggerTopBarPulse() {
@@ -998,7 +1145,6 @@ function renderDashboardUI(activeTab) {
     if (!settings) return;
 
     if (activeTab === 'models') {
-        // --- 🤖 模型总览（Model-First，核心大账本）---
         const today = settings.today;
         const total = settings.totals;
         const todayActiveMs = settings.activeTime?.daily?.[getTodayDateString()] || 0;
@@ -1008,7 +1154,7 @@ function renderDashboardUI(activeTab) {
 
         let modelCardsHtml = '';
         if (mKeys.length === 0) {
-            modelCardsHtml = '<div style="text-align:center; padding: 40px 20px; color:#94a3b8; font-size:13px;">暂无模型调用数据。开始对话或触发预设后将在此呈现。</div>';
+            modelCardsHtml = '<div style="text-align:center; padding: 40px 20px; color:#94a3b8; font-size:13px;">暂无模型调用数据。开始对话、触发预设或向量检索后将在此呈现。</div>';
         } else {
             const grandTotalTokens = Math.max(1, mKeys.reduce((acc, k) => acc + (models[k].total_tokens || 0), 0));
 
@@ -1024,7 +1170,7 @@ function renderDashboardUI(activeTab) {
                 let rowsHtml = '';
 
                 if (catEntries.length === 0) {
-                    rowsHtml = '<div style="font-size:11px; color:#94a3b8; padding:6px 0;">（新发起的调用将在此清晰展示主聊 vs 预设比例）</div>';
+                    rowsHtml = '<div style="font-size:11px; color:#94a3b8; padding:6px 0;">（新发起的调用将在此清晰展示主聊 vs 预设/向量比例）</div>';
                 }
 
                 for (const [ck, cv] of catEntries) {
@@ -1090,12 +1236,11 @@ function renderDashboardUI(activeTab) {
             </div>
 
             <div class="omni-section-title">
-                <i class="fa-solid fa-cubes-stacked" style="color:#38bdf8;"></i> 模型用量明细 (按模型归集，清晰展示主聊与预设比例)
+                <i class="fa-solid fa-cubes-stacked" style="color:#38bdf8;"></i> 模型用量明细 (按模型归集，清晰展示主聊、预设与向量比例)
             </div>
             ${modelCardsHtml}
         `);
     } else if (activeTab === 'rpg') {
-        // --- 🏰 陪伴手账 ---
         const daily = settings.activeTime?.daily || {};
         const entries = Object.keys(daily).map(d => ({
             date: d,
@@ -1206,7 +1351,7 @@ function renderDashboardUI(activeTab) {
     } else if (activeTab === 'logs') {
         const logs = settings.recentLogs || [];
         if (logs.length === 0) {
-            $panel.html('<div style="text-align:center; padding: 50px 20px; color:#94a3b8; font-size:13px;">暂无调用记录。与酒馆对话、或触发预设/TTS时将在此实时显示。</div>');
+            $panel.html('<div style="text-align:center; padding: 50px 20px; color:#94a3b8; font-size:13px;">暂无调用记录。与酒馆对话、触发预设、TTS或向量检索时将在此实时显示。</div>');
             return;
         }
 
@@ -1249,17 +1394,33 @@ function renderDashboardUI(activeTab) {
             </div>
         `);
     } else if (activeTab === 'settings') {
+        const isFloating = (settings.badgeMode !== 'topbar');
+
         $panel.html(`
             <div style="font-size: 13px; line-height: 1.8;">
                 <div class="omni-setting-row">
                     <div>
-                        <div class="omni-setting-label">显示顶栏快捷指示器</div>
-                        <div class="omni-setting-desc">在酒馆顶栏显示 ⚡ 今日消耗与活跃时长（关闭后界面更清爽，可随时在扩展列表中打开看板）</div>
+                        <div class="omni-setting-label">显示快捷指示器胶囊</div>
+                        <div class="omni-setting-desc">显示 ⚡ 今日消耗与活跃时长（关闭后更清爽，可随时在此重新开启）</div>
                     </div>
                     <label class="omni-switch">
                         <input type="checkbox" id="omni_modal_toggle_topbar" ${settings.showInTopBar ? 'checked' : ''}>
                         <span class="omni-slider"></span>
                     </label>
+                </div>
+
+                <div class="omni-setting-row">
+                    <div>
+                        <div class="omni-setting-label">胶囊展示形态</div>
+                        <div class="omni-setting-desc">推荐「自由悬浮胶囊」：可在屏幕任意拖动，触屏/鼠标松手自动记忆位置，绝不遮挡预设按钮</div>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:8px;">
+                        <select id="omni_badge_mode_select" style="background:#28283c; color:#fff; border:1px solid #3c3c52; padding:5px 8px; border-radius:6px; font-size:12px;">
+                            <option value="floating" ${isFloating ? 'selected' : ''}>🧲 自由悬浮胶囊 (可拖动记忆)</option>
+                            <option value="topbar" ${!isFloating ? 'selected' : ''}>📌 顶栏内嵌模式</option>
+                        </select>
+                        <button class="menu_button" id="omni_btn_reset_badge_pos" style="padding:4px 8px; font-size:11px;" title="将悬浮胶囊恢复到默认右上角位置">复位位置</button>
+                    </div>
                 </div>
 
                 <div class="omni-actions" style="margin-top:20px;">
@@ -1282,11 +1443,27 @@ function renderDashboardUI(activeTab) {
 
             if (isChecked) {
                 tryMountUI();
-                if (window.toastr) toastr.success('已开启顶栏指示器');
+                if (window.toastr) toastr.success('已开启指示器胶囊');
             } else {
                 $('#omni_tracker_topbar_btn').remove();
-                if (window.toastr) toastr.info('已隐藏顶栏指示器（可随时从右侧扩展设置中重新打开）');
+                if (window.toastr) toastr.info('已隐藏指示器胶囊');
             }
+        });
+
+        $('#omni_badge_mode_select').on('change', function () {
+            const mode = $(this).val();
+            settings.badgeMode = mode;
+            safeSaveSettings();
+            tryMountUI();
+            if (window.toastr) toastr.success(mode === 'floating' ? '已切换为自由悬浮胶囊模式（可随意拖动）' : '已切换为顶栏内嵌模式');
+        });
+
+        $('#omni_btn_reset_badge_pos').on('click', () => {
+            settings.badgePos = { top: 75, left: window.innerWidth - 110 };
+            localStorage.removeItem('omni_badge_pos');
+            safeSaveSettings();
+            tryMountUI();
+            if (window.toastr) toastr.success('悬浮胶囊位置已复位到右上角！');
         });
 
         $('#omni_btn_reset_session').on('click', () => {
@@ -1309,7 +1486,8 @@ function renderDashboardUI(activeTab) {
             let estimatedWater = 0;
             const bm = settings.byModel || {};
             for (const [m, v] of Object.entries(bm)) {
-                if ('tts' in m.toLowerCase() || 'mimo' in m.toLowerCase()) continue;
+                const ml = m.toLowerCase();
+                if (ml.includes('tts') || ml.includes('mimo') || ml.includes('embed') || ml.includes('rerank') || ml.includes('bge') || v.byCategory?.vectors) continue;
                 const c = v.completion_tokens || 0;
                 const p = v.prompt_tokens || 0;
                 if (c === 0 && p > 0) estimatedWater += p;
@@ -1324,7 +1502,7 @@ function renderDashboardUI(activeTab) {
             }
 
             const waterStr = formatTokens(estimatedWater);
-            if (confirm(`【智能去水清洗诊断】\n\n检测到历史数据存在约 ${waterStr} 的异常注水 Tokens（通常由旧版本误抓酒馆内部正则修剪产生）。\n\n- 保留：全部真实 AI 回复 (Completion)\n- 保留：全部语音朗读 (TTS)\n- 保留：全部 RPG 冒险者时长与成就\n- 剔除：内部数据传输产生的虚高 Prompt\n\n是否立即执行一键去水校准？`)) {
+            if (confirm(`【智能去水清洗诊断】\n\n检测到历史数据存在约 ${waterStr} 的异常注水 Tokens（通常由旧版本误抓酒馆内部正则修剪产生）。\n\n- 保留：全部真实 AI 回复 (Completion)\n- 保留：全部语音朗读 (TTS)\n- 保留：全部向量与重排检索 (Vectors)\n- 保留：全部 RPG 冒险者时长与成就\n- 剔除：内部数据传输产生的虚高 Prompt\n\n是否立即执行一键去水校准？`)) {
                 const res = cleanHistoricalWaterData();
                 renderDashboardUI('settings');
                 updateTopBarUI();

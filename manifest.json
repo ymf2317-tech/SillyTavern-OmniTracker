@@ -6,7 +6,7 @@
     "js": "index.js",
     "css": "style.css",
     "author": "ymf2317-tech",
-    "version": "1.5.2",
+    "version": "1.6.0",
     "homePage": "https://github.com/ymf2317-tech/SillyTavern-OmniTracker",
     "auto_update": true
 }
